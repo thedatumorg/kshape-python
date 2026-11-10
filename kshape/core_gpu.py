@@ -213,14 +213,17 @@ def _extract_shape(idx, x, j, cur_center):
     return zscore(centroid, ddof=1)
 
 
-def _kshape(x, k, centroid_init='zero', max_iter=100):
+def _kshape(x, k, centroid_init='zero', max_iter=100, batched=True):
     m = x.shape[0]
-    idx = torch.randint(0, k, (m,), dtype=torch.float32).to("cuda").long()
+    idx = torch.randint(0, k, (m,), dtype=torch.float32).to("cuda")
     if centroid_init == 'zero':
         centroids = torch.zeros(k, x.shape[1], x.shape[2], device="cuda", dtype=torch.float32)
     elif centroid_init == 'random':
         indices = torch.randperm(x.shape[0])[:k]
         centroids = x[indices].clone()
+    if not batched:
+        return _kshape_loop(x, k, idx, centroids, max_iter)
+    idx = idx.long()
     data = _Batched(x)
 
     n_iter = 0
@@ -249,23 +252,55 @@ def _kshape(x, k, centroid_init='zero', max_iter=100):
     return idx, centroids, n_iter
 
 
+def _kshape_loop(x, k, idx, centroids, max_iter):
+    """The per-series version: one shape extraction per (cluster, dimension), one NCC per (series, centroid)."""
+    m = x.shape[0]
+    distances = torch.empty(m, k, device="cuda")
+
+    n_iter = 0
+    for it in range(max_iter):
+        n_iter = it + 1
+        old_idx = idx
+        for j in range(k):
+            for d in range(x.shape[2]):
+                centroids[j, :, d] = _extract_shape(idx, torch.unsqueeze(x[:, :, d], axis=2), j, torch.unsqueeze(centroids[j, :, d], axis=1))
+                #centroids[j] = torch.unsqueeze(_extract_shape(idx, x, j, centroids[j]), dim=1)
+
+        for i, ts in enumerate(x):
+            for c, ct in enumerate(centroids):
+                dist = 1 - _ncc_c_3dim(ts, ct).max()
+                distances[i, c] = dist
+
+        idx = distances.argmin(1)
+        if torch.equal(old_idx, idx):
+            break
+
+    return idx, centroids, n_iter
+
+
 def _clusters(idx, centroids):
     return [(centroid, torch.nonzero(idx == i).flatten().tolist()) for i, centroid in enumerate(centroids)]
 
 
-def kshape(x, k, centroid_init='zero', max_iter=100):
+def kshape(x, k, centroid_init='zero', max_iter=100, batched=True):
     x = torch.tensor(x, device="cuda", dtype=torch.float32)
-    idx, centroids, _ = _kshape(x, k, centroid_init=centroid_init, max_iter=max_iter)
+    idx, centroids, _ = _kshape(x, k, centroid_init=centroid_init, max_iter=max_iter, batched=batched)
     return _clusters(idx, centroids)
 
 class KShapeClusteringGPU(ClusterMixin,BaseEstimator):
+    """k-Shape on a CUDA device.
+
+    With batched=True (the default), every step runs on all series and clusters at once. With batched=False, the
+    shapes and distances are computed one series and one (series, centroid) pair at a time.
+    """
     labels_= None
     centroids_ = None
 
-    def __init__(self,n_clusters, centroid_init='zero', max_iter=100):
+    def __init__(self,n_clusters, centroid_init='zero', max_iter=100, batched=True):
         self.n_clusters = n_clusters
         self.centroid_init = centroid_init
         self.max_iter = max_iter
+        self.batched = batched
 
 
     def fit(self,X,y=None):
@@ -284,13 +319,23 @@ class KShapeClusteringGPU(ClusterMixin,BaseEstimator):
 
     def _predict(self,x, centroids):
         x = torch.tensor(x, device="cuda", dtype=torch.float32)
-        idx = _Batched(x).distances(centroids).argmin(1)
+        if self.batched:
+            return _Batched(x).distances(centroids).argmin(1), centroids
+        m = x.shape[0]
+        distances = torch.empty(m, self.n_clusters, device="cuda")
+
+        for i, ts in enumerate(x):
+            for c, ct in enumerate(centroids):
+                dist = 1 - _ncc_c_3dim(ts, ct).max()
+                distances[i, c] = dist
+
+        idx = distances.argmin(1)
         return idx, centroids
 
 
     def _fit(self,x, k, centroid_init='zero', max_iter=100):
         x = torch.tensor(x, device="cuda", dtype=torch.float32)
-        idx, centroids, self.n_iter_ = _kshape(x, k, centroid_init=centroid_init, max_iter=max_iter)
+        idx, centroids, self.n_iter_ = _kshape(x, k, centroid_init=centroid_init, max_iter=max_iter, batched=self.batched)
         return _clusters(idx, centroids)
 
 
